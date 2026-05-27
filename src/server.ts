@@ -11,6 +11,7 @@ import { characterRoutes } from "./routes/character.routes.js";
 import { sessionRoutes } from "./routes/session.routes.js";
 import { conversationRoutes } from "./routes/conversation.routes.js";
 import { memoryRoutes } from "./routes/memory.routes.js";
+import { voiceRoutes } from "./routes/voice.routes.js";
 import { startMemoryWorker } from "./workers/memory.worker.js";
 
 const app = Fastify({ logger: false });
@@ -31,6 +32,9 @@ await app.register(conversationRoutes, { prefix: "/api/v1/conversations" });
 
 // Sprint 3
 await app.register(memoryRoutes, { prefix: "/api/v1/memories" });
+
+// Sprint 4
+await app.register(voiceRoutes, { prefix: "/api/v1/voice" });
 
 async function start(): Promise<void> {
   await connectDatabase();
