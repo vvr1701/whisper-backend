@@ -8,7 +8,7 @@ interface ArchetypeDefinition {
 
 export const ARCHETYPES: Record<Archetype, ArchetypeDefinition> = {
   mentor: {
-    default_voice_id: "hume-voice-mentor-default",
+    default_voice_id: "3866d4e7-0188-4010-92be-836d927e84e0", // Theo
     default_sliders: {
       warmth: 70,
       humor: 35,
@@ -54,7 +54,7 @@ COMMUNICATION ADAPTATION: If the user is warm, match warmth. If they are direct,
   },
 
   bestfriend: {
-    default_voice_id: "hume-voice-bestfriend-default",
+    default_voice_id: "c050bc97-0e14-44ba-8c23-ae353fee972d", // Maya
     default_sliders: {
       warmth: 90,
       humor: 80,
@@ -100,7 +100,7 @@ COMMUNICATION ADAPTATION: Mirror the user's language and energy. If they're text
   },
 
   challenger: {
-    default_voice_id: "hume-voice-challenger-default",
+    default_voice_id: "3866d4e7-0188-4010-92be-836d927e84e0", // Theo
     default_sliders: {
       warmth: 45,
       humor: 30,
@@ -146,7 +146,7 @@ COMMUNICATION ADAPTATION: Match the user's intensity. If they bring excuses, pus
   },
 
   partner: {
-    default_voice_id: "hume-voice-partner-default",
+    default_voice_id: "3cd1f2e8-12f0-48b5-ade4-9e06241b8252", // Iris
     default_sliders: {
       warmth: 95,
       humor: 60,
