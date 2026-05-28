@@ -3,7 +3,7 @@ import { z } from "zod";
 import { Types } from "mongoose";
 import { Session } from "../models/session.model.js";
 import { initSessionContext } from "../services/session-context.service.js";
-import { enqueueMemoryExtraction } from "../queues/memory.queue.js";
+import { endSessionById } from "../services/session.service.js";
 import { logger } from "../utils/logger.js";
 
 const StartBodySchema = z.object({
@@ -53,37 +53,20 @@ export async function sessionRoutes(app: FastifyInstance): Promise<void> {
 
   // POST /api/v1/sessions/:id/end
   app.post<{ Params: { id: string } }>("/:id/end", async (request, reply) => {
-    const session = await Session.findById(request.params.id);
-    if (!session) {
-      return reply.status(404).send({ success: false, error: "Session not found" });
-    }
-
     const parsed = EndBodySchema.safeParse(request.body);
     const endedAt = parsed.success && parsed.data.ended_at
       ? new Date(parsed.data.ended_at)
       : new Date();
 
-    const duration_seconds = Math.floor(
-      (endedAt.getTime() - session.started_at.getTime()) / 1000
-    );
+    const duration_seconds = await endSessionById(request.params.id, "completed", endedAt);
 
-    session.ended_at = endedAt;
-    session.duration_seconds = duration_seconds;
-    session.status = "completed";
-    await session.save();
-
-    void enqueueMemoryExtraction({
-      sessionId: session._id.toString(),
-      characterId: session.character_id.toString(),
-      userId: session.user_id,
-    }).catch((err) => logger.error({ err, sessionId: session._id }, "Failed to enqueue memory extraction"));
+    if (duration_seconds === null) {
+      return reply.status(404).send({ success: false, error: "Session not found or already ended" });
+    }
 
     return reply.send({
       success: true,
-      data: {
-        session_id: session._id.toString(),
-        duration_seconds,
-      },
+      data: { session_id: request.params.id, duration_seconds },
     });
   });
 
@@ -112,12 +95,7 @@ export async function sessionRoutes(app: FastifyInstance): Promise<void> {
         success: true,
         data: {
           sessions,
-          pagination: {
-            page,
-            limit,
-            total,
-            has_more: skip + sessions.length < total,
-          },
+          pagination: { page, limit, total, has_more: skip + sessions.length < total },
         },
       });
     }

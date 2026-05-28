@@ -13,6 +13,7 @@ import { conversationRoutes } from "./routes/conversation.routes.js";
 import { memoryRoutes } from "./routes/memory.routes.js";
 import { voiceRoutes } from "./routes/voice.routes.js";
 import { startMemoryWorker } from "./workers/memory.worker.js";
+import { startStaleSessionCleanup } from "./services/stale-session.service.js";
 
 const app = Fastify({ logger: false });
 
@@ -40,6 +41,7 @@ async function start(): Promise<void> {
   await connectDatabase();
   await connectRedis();
   startMemoryWorker();
+  startStaleSessionCleanup();
 
   await app.listen({ port: env.PORT, host: "0.0.0.0" });
   logger.info(`Whisper backend listening on port ${env.PORT}`);
