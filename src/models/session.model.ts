@@ -37,4 +37,7 @@ const sessionSchema = new Schema<ISession>(
   { timestamps: false, versionKey: false }
 );
 
+// Compound index: stale-session cleanup queries { status: "active", started_at: < cutoff }
+sessionSchema.index({ status: 1, started_at: 1 });
+
 export const Session = model<ISession>("Session", sessionSchema);
