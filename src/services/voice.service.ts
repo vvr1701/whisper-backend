@@ -50,6 +50,11 @@ const FRAME_DURATION_MS = 10;
 const SAMPLES_PER_FRAME = (TTS_OUTPUT_SAMPLE_RATE * FRAME_DURATION_MS) / 1000; // 480
 const LATENCY_WARN_MS = 1500;
 const SENTENCE_SPLIT_REGEX = /([^.!?\n]+[.!?\n]+)/g;
+const UI_STATE_TOPIC = "ui";
+const IDLE_DEBOUNCE_MS = 400;
+
+export type AgentState = "idle" | "listening" | "thinking" | "speaking";
+export type PublishState = (state: AgentState) => void;
 
 const EMPTY_CTX: IRedisSessionContext = {
   compressed_summary: "",
@@ -77,6 +82,7 @@ interface RunTurnParams {
   tts: HumeTTSSession;
   signal: AbortSignal;
   onLatency: (ms: number) => void;
+  publishState: PublishState;
 }
 
 /**
@@ -94,7 +100,11 @@ async function runTurn(params: RunTurnParams): Promise<void> {
     tts,
     signal,
     onLatency,
+    publishState,
   } = params;
+
+  // We have a final transcript and are about to call the LLM — UI hint.
+  publishState("thinking");
 
   // Parallel I/O: persona, session context, safety, memory, summary
   const [personaConfig, rawSessionCtx, modResult, memoryBlock, latestSummary] =
@@ -334,14 +344,26 @@ async function persistTurns(p: PersistTurnsParams): Promise<void> {
  * handle concurrent captureFrame calls on the same source (throws InvalidState),
  * so multiple Hume chunks arriving in parallel must funnel through one drainer.
  */
+interface AudioWriterCallbacks {
+  onFirstChunk?: () => void;
+  onDrained?: () => void;
+}
+
 class SerialAudioWriter {
   private queue: Int16Array[] = [];
   private draining = false;
+  private idleTimer: NodeJS.Timeout | null = null;
 
-  constructor(private source: AudioSource) {}
+  constructor(private source: AudioSource, private callbacks: AudioWriterCallbacks = {}) {}
 
   enqueue(pcm: Int16Array): void {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
+    const wasEmpty = this.queue.length === 0 && !this.draining;
     this.queue.push(pcm);
+    if (wasEmpty) this.callbacks.onFirstChunk?.();
     void this.drain();
   }
 
@@ -370,11 +392,22 @@ class SerialAudioWriter {
       }
     } finally {
       this.draining = false;
+      // Audio has drained — schedule "idle" if no new chunks arrive within debounce window.
+      if (this.callbacks.onDrained) {
+        this.idleTimer = setTimeout(() => {
+          this.idleTimer = null;
+          this.callbacks.onDrained?.();
+        }, IDLE_DEBOUNCE_MS);
+      }
     }
   }
 
   /** Drop pending PCM and flush the underlying source (barge-in path). */
   clear(): void {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
     this.queue.length = 0;
     this.source.clearQueue();
   }
@@ -415,9 +448,27 @@ export async function runVoicePipeline(ctx: JobContext): Promise<void> {
 
   await ctx.connect(undefined, AutoSubscribe.AUDIO_ONLY);
 
+  // UI state publisher: emits {kind: "agent_state", state} on DataChannel topic "ui"
+  // so the mobile client can drive its orb without local guessing.
+  let lastPublishedState: AgentState | null = null;
+  const stateEncoder = new TextEncoder();
+  const publishState: PublishState = (state) => {
+    if (state === lastPublishedState) return;
+    lastPublishedState = state;
+    const payload = stateEncoder.encode(JSON.stringify({ kind: "agent_state", state }));
+    const lp = ctx.room.localParticipant;
+    if (!lp) return;
+    lp.publishData(payload, { reliable: true, topic: UI_STATE_TOPIC }).catch((err) =>
+      logger.warn({ err, state }, "publishData(agent_state) failed")
+    );
+  };
+
   // Publish agent's output audio track (Hume → LiveKit)
   const audioSource = new AudioSource(TTS_OUTPUT_SAMPLE_RATE, TTS_OUTPUT_CHANNELS);
-  const audioWriter = new SerialAudioWriter(audioSource);
+  const audioWriter = new SerialAudioWriter(audioSource, {
+    onFirstChunk: () => publishState("speaking"),
+    onDrained: () => publishState("idle"),
+  });
   const agentTrack = LocalAudioTrack.createAudioTrack("agent-audio", audioSource);
   const publishOpts = new TrackPublishOptions();
   publishOpts.source = TrackSource.SOURCE_MICROPHONE;
@@ -482,6 +533,7 @@ export async function runVoicePipeline(ctx: JobContext): Promise<void> {
       tts,
       signal: abortCtrl.signal,
       onLatency: (ms) => latencies.push(ms),
+      publishState,
     })
       .catch((err) => logger.error({ err, sessionId }, "runTurn failed"))
       .finally(() => {
@@ -491,18 +543,22 @@ export async function runVoicePipeline(ctx: JobContext): Promise<void> {
 
   const stt = new DeepgramSTTSession({
     onSpeechStarted: () => {
-      // Barge-in: only when a turn is active (bot is talking) AND we're past the grace period.
-      if (!activeTurnAbort) return;
-      const elapsed = Date.now() - botStartedSpeakingAt;
-      if (elapsed < BARGE_IN_GRACE_MS) {
-        logger.debug({ sessionId, elapsedMs: elapsed }, "Ignoring SpeechStarted within barge-in grace");
-        return;
+      // Within the barge-in grace window the "speech" is almost certainly the bot's
+      // own audio bleeding back into the mic — don't flip the orb to listening.
+      if (activeTurnAbort) {
+        const elapsed = Date.now() - botStartedSpeakingAt;
+        if (elapsed < BARGE_IN_GRACE_MS) {
+          logger.debug({ sessionId, elapsedMs: elapsed }, "Ignoring SpeechStarted within barge-in grace");
+          return;
+        }
+        logger.info({ sessionId, elapsedMs: elapsed }, "Barge-in — cancelling turn");
+        activeTurnAbort.abort();
+        activeTurnAbort = null;
+        tts.cancelTurn();        // close Hume socket; next turn reopens
+        audioWriter.clear();     // drop already-queued audio frames
       }
-      logger.info({ sessionId, elapsedMs: elapsed }, "Barge-in — cancelling turn");
-      activeTurnAbort.abort();
-      activeTurnAbort = null;
-      tts.cancelTurn();        // close Hume socket; next turn reopens
-      audioWriter.clear();     // drop already-queued audio frames
+      // Either no active turn (fresh utterance) or we just bargedin → user is speaking.
+      publishState("listening");
     },
     onFinalSegment: ({ text }) => {
       // Accumulate; do not trigger a turn yet.
