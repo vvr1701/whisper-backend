@@ -1,8 +1,11 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { User } from "../models/user.model.js";
-import { Character } from "../models/character.model.js";
 import { getArchetypeConfig } from "../data/archetypes.js";
+import {
+  createCompanion,
+  CompanionValidationError,
+} from "../services/character.service.js";
 import type { OnboardResponse } from "../types/user.types.js";
 
 const OnboardBodySchema = z.object({
@@ -67,28 +70,43 @@ export async function userRoutes(app: FastifyInstance): Promise<void> {
 
     const archetypeDef = getArchetypeConfig(body.companion.archetype);
 
-    // Merge archetype default sliders with any user-provided overrides
+    // Onboard preserves its archetype-tuned defaults (different from the
+    // flat 50/50/50/50/50 the standalone /characters/create uses).
     const sliders = {
       ...archetypeDef.default_sliders,
       ...body.companion.personality_sliders,
     };
 
-    const character = await Character.create({
-      user_id: user._id.toString(),
-      archetype: body.companion.archetype,
-      name: body.companion.name,
-      gender: body.companion.gender,
-      voice_id: body.companion.voice_id || archetypeDef.default_voice_id,
-      persona_config: archetypeDef.persona_config,
-      personality_sliders: sliders,
-    });
+    try {
+      const character = await createCompanion({
+        user_id: user._id.toString(),
+        archetype: body.companion.archetype,
+        gender: body.companion.gender,
+        voice_id: body.companion.voice_id || archetypeDef.default_voice_id,
+        name: body.companion.name,
+        personality_sliders: sliders,
+      });
 
-    const response: OnboardResponse = {
-      user_id: user._id.toString(),
-      character_id: character._id.toString(),
-    };
+      const response: OnboardResponse = {
+        user_id: user._id.toString(),
+        character_id: character._id.toString(),
+      };
 
-    return reply.status(201).send({ success: true, data: response });
+      return reply.status(201).send({ success: true, data: response });
+    } catch (err) {
+      if (err instanceof CompanionValidationError) {
+        // Roll back the just-created user so onboard stays atomic from the
+        // caller's perspective.
+        await User.deleteOne({ _id: user._id });
+        return reply.status(400).send({
+          success: false,
+          error: err.message,
+          code: "VALIDATION_ERROR",
+          field: err.field,
+        });
+      }
+      throw err;
+    }
   });
 
   // GET /api/v1/users/:id
