@@ -1,6 +1,10 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
+import { Types } from "mongoose";
 import { User } from "../models/user.model.js";
+import { Character } from "../models/character.model.js";
+import { Session } from "../models/session.model.js";
+import { Memory } from "../models/memory.model.js";
 import { getArchetypeConfig } from "../data/archetypes.js";
 import {
   createCompanion,
@@ -107,6 +111,53 @@ export async function userRoutes(app: FastifyInstance): Promise<void> {
       }
       throw err;
     }
+  });
+
+  // GET /api/v1/users/:id/stats — aggregate counts across the user's companions
+  // Registered before /:id so Fastify matches "/:id/stats" before "/:id".
+  app.get<{ Params: { id: string } }>("/:id/stats", async (request, reply) => {
+    const { id } = request.params;
+
+    if (!Types.ObjectId.isValid(id)) {
+      return reply.status(400).send({ success: false, error: "Invalid user id" });
+    }
+
+    const user = await User.findById(id).select("created_at").lean();
+    if (!user) {
+      return reply.status(404).send({ success: false, error: "User not found" });
+    }
+
+    const [total_companions, sessionAgg, total_memories] = await Promise.all([
+      Character.countDocuments({
+        user_id: id,
+        mode: "companion",
+        is_active: true,
+      }),
+      Session.aggregate<{ total_sessions: number; total_voice_minutes: number }>([
+        { $match: { user_id: id } },
+        {
+          $group: {
+            _id: null,
+            total_sessions: { $sum: 1 },
+            total_voice_minutes: { $sum: "$voice_minutes_consumed" },
+          },
+        },
+      ]),
+      Memory.countDocuments({ user_id: id, is_deleted: false }),
+    ]);
+
+    const totals = sessionAgg[0] ?? { total_sessions: 0, total_voice_minutes: 0 };
+
+    return reply.send({
+      success: true,
+      data: {
+        total_companions,
+        total_sessions: totals.total_sessions,
+        total_voice_minutes: totals.total_voice_minutes,
+        total_memories,
+        member_since: user.created_at.toISOString(),
+      },
+    });
   });
 
   // GET /api/v1/users/:id
