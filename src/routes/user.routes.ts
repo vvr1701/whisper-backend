@@ -1,8 +1,15 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
+import { Types } from "mongoose";
 import { User } from "../models/user.model.js";
 import { Character } from "../models/character.model.js";
+import { Session } from "../models/session.model.js";
+import { Memory } from "../models/memory.model.js";
 import { getArchetypeConfig } from "../data/archetypes.js";
+import {
+  createCompanion,
+  CompanionValidationError,
+} from "../services/character.service.js";
 import type { OnboardResponse } from "../types/user.types.js";
 
 const OnboardBodySchema = z.object({
@@ -67,28 +74,90 @@ export async function userRoutes(app: FastifyInstance): Promise<void> {
 
     const archetypeDef = getArchetypeConfig(body.companion.archetype);
 
-    // Merge archetype default sliders with any user-provided overrides
+    // Onboard preserves its archetype-tuned defaults (different from the
+    // flat 50/50/50/50/50 the standalone /characters/create uses).
     const sliders = {
       ...archetypeDef.default_sliders,
       ...body.companion.personality_sliders,
     };
 
-    const character = await Character.create({
-      user_id: user._id.toString(),
-      archetype: body.companion.archetype,
-      name: body.companion.name,
-      gender: body.companion.gender,
-      voice_id: body.companion.voice_id || archetypeDef.default_voice_id,
-      persona_config: archetypeDef.persona_config,
-      personality_sliders: sliders,
+    try {
+      const character = await createCompanion({
+        user_id: user._id.toString(),
+        archetype: body.companion.archetype,
+        gender: body.companion.gender,
+        voice_id: body.companion.voice_id || archetypeDef.default_voice_id,
+        name: body.companion.name,
+        personality_sliders: sliders,
+      });
+
+      const response: OnboardResponse = {
+        user_id: user._id.toString(),
+        character_id: character._id.toString(),
+      };
+
+      return reply.status(201).send({ success: true, data: response });
+    } catch (err) {
+      if (err instanceof CompanionValidationError) {
+        // Roll back the just-created user so onboard stays atomic from the
+        // caller's perspective.
+        await User.deleteOne({ _id: user._id });
+        return reply.status(400).send({
+          success: false,
+          error: err.message,
+          code: "VALIDATION_ERROR",
+          field: err.field,
+        });
+      }
+      throw err;
+    }
+  });
+
+  // GET /api/v1/users/:id/stats — aggregate counts across the user's companions
+  // Registered before /:id so Fastify matches "/:id/stats" before "/:id".
+  app.get<{ Params: { id: string } }>("/:id/stats", async (request, reply) => {
+    const { id } = request.params;
+
+    if (!Types.ObjectId.isValid(id)) {
+      return reply.status(400).send({ success: false, error: "Invalid user id" });
+    }
+
+    const user = await User.findById(id).select("created_at").lean();
+    if (!user) {
+      return reply.status(404).send({ success: false, error: "User not found" });
+    }
+
+    const [total_companions, sessionAgg, total_memories] = await Promise.all([
+      Character.countDocuments({
+        user_id: id,
+        mode: "companion",
+        is_active: true,
+      }),
+      Session.aggregate<{ total_sessions: number; total_voice_minutes: number }>([
+        { $match: { user_id: id } },
+        {
+          $group: {
+            _id: null,
+            total_sessions: { $sum: 1 },
+            total_voice_minutes: { $sum: "$voice_minutes_consumed" },
+          },
+        },
+      ]),
+      Memory.countDocuments({ user_id: id, is_deleted: false }),
+    ]);
+
+    const totals = sessionAgg[0] ?? { total_sessions: 0, total_voice_minutes: 0 };
+
+    return reply.send({
+      success: true,
+      data: {
+        total_companions,
+        total_sessions: totals.total_sessions,
+        total_voice_minutes: totals.total_voice_minutes,
+        total_memories,
+        member_since: user.created_at.toISOString(),
+      },
     });
-
-    const response: OnboardResponse = {
-      user_id: user._id.toString(),
-      character_id: character._id.toString(),
-    };
-
-    return reply.status(201).send({ success: true, data: response });
   });
 
   // GET /api/v1/users/:id
